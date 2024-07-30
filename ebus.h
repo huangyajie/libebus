@@ -44,6 +44,7 @@ struct ebus_ctx
     struct ebus_method* mts;
     int mts_cnt;
     int session;  //通信会话
+    char path[128];
     struct rb_root root_session; //用于存放调用会话信息
 };
 
@@ -57,6 +58,9 @@ int ebus_connect(struct ebus_ctx* ctx,const char* path);
 
 //方法调用
 int ebus_invoke(struct ebus_ctx* ctx,const char* service,const char* method,void* req,int req_sz,void* resp,int* resp_sz,int timeout);
+
+//响应
+int ebus_response(struct ebus_ctx* ctx,int session,void* req,int req_sz);
 
 //退出，资源释放
 int ebus_exit(struct ebus_ctx* ctx);

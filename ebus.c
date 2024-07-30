@@ -6,12 +6,12 @@
 #include "eco_socket.h"
 #include "ebus.h"
 
-
+static int _ebus_connect(struct ebus_ctx* ctx);
 
 //初始化
 struct ebus_ctx* ebus_init(const char* service,struct ebus_method* mts,int mts_cnt)
 {
-    if((service == NULL) || (mts == NULL) || (mts_cnt <= 0))
+    if(service == NULL)
     {
         return NULL;
     }
@@ -21,20 +21,25 @@ struct ebus_ctx* ebus_init(const char* service,struct ebus_method* mts,int mts_c
     {
         return NULL;
     }
-
-    ctx->mts = (struct ebus_method*)calloc(mts_cnt,sizeof(struct ebus_method));
-    if(ctx->mts == NULL)
+    
+    
+    if(mts_cnt > 0)
     {
-        free(ctx);
-        ctx = NULL;
-        return NULL;
+        ctx->mts = (struct ebus_method*)calloc(mts_cnt,sizeof(struct ebus_method));
+        if(ctx->mts == NULL)
+        {
+            free(ctx);
+            ctx = NULL;
+            return NULL;
+        }
+    
+        memcpy(ctx->mts,mts,sizeof(struct ebus_method)*mts_cnt);
+        ctx->mts_cnt = mts_cnt;
     }
+    
+
     ctx->fd = -1;
-    memcpy(ctx->mts,mts,sizeof(struct ebus_method)*mts_cnt);
-    ctx->mts_cnt = mts_cnt;
-
     snprintf(ctx->service,sizeof(ctx->service),"%s",service);
-
     rbtree_init(ctx->root_session);
 
     return ctx;
@@ -52,15 +57,17 @@ static int _ebus_register(struct ebus_ctx* ctx)
     int ret = -1;
     int msg_type = -1;
     int session = -1;
+    int status = -1;
     char method[METHOD_NAME_LEN] = {0};
+    char service[SERVICE_NAME_LEN] = {0};
     char* resp = (char*)calloc(1,MAX_MSG_LEN);
     if(resp == NULL)
     {
         return -1;
     }
  
-    ebus_send_msg(ctx,"EBUSD","",MSG_TYPE_REG,++ctx->session,NULL,0);
-    ret = ebus_receive_msg(ctx,method,&msg_type,&session,resp,MAX_MSG_LEN);
+    ebus_send_msg(ctx->fd,ctx->service,"",MSG_TYPE_REG,++ctx->session,EBUS_STATUS_OK,NULL,0);
+    ret = ebus_receive_msg(ctx->fd,service,method,&msg_type,&session,&status,resp,MAX_MSG_LEN);
     if(ret <= 0)
     {
         free(resp);
@@ -68,7 +75,8 @@ static int _ebus_register(struct ebus_ctx* ctx)
         return -1;
     }
 
-    if(msg_type != MSG_TYPE_REG)
+
+    if((status != EBUS_STATUS_OK) || (msg_type != MSG_TYPE_REG))
     {
         free(resp);
         resp = NULL;
@@ -81,9 +89,9 @@ static int _ebus_register(struct ebus_ctx* ctx)
     return 0;
 }
 
-static int _ebus_msg_proc(struct ebus_ctx* ctx,const char* method,int msg_type,int session,void* msg,int msg_sz)
+static int _ebus_msg_proc(struct ebus_ctx* ctx,const char* service,const char* method,int msg_type,int session,int status,void* msg,int msg_sz)
 {
-    if((ctx == NULL) || (method == NULL) || (msg == NULL))
+    if((ctx == NULL) || (service == NULL) || (method == NULL) || (msg == NULL))
     {
         return -1;
     }
@@ -117,17 +125,22 @@ static int _ebus_msg_proc(struct ebus_ctx* ctx,const char* method,int msg_type,i
         free(rn->value);
         rn->value = NULL;
 
-        rn->value = (char*)calloc(1,msg_sz+4);
-        memcpy(rn->value,&msg_sz,sizeof(int));
-        memcpy(rn->value+sizeof(int),msg,msg_sz);
-        
+        rn->value = (char*)calloc(1,msg_sz+sizeof(int)+sizeof(int));
+        memcpy(rn->value,&status,sizeof(int));
+        if(status == EBUS_STATUS_OK)
+        {
+            memcpy(rn->value+sizeof(int),&msg_sz,sizeof(int));
+            memcpy(rn->value+sizeof(int)+sizeof(int),msg,msg_sz);
+        }
+       
         eco_write(fd,"R",1);
     }
-    else
+    else //不支持的消息类型 
     {
-        //不支持的消息类型  noting to do
+        // nothing to do
     }
 
+    return 0;
 }
 
 static void _ebus_msg_func(struct schedule * sch, void *ud)
@@ -136,7 +149,9 @@ static void _ebus_msg_func(struct schedule * sch, void *ud)
     int ret = -1;
     int msg_type = -1;
     int session = -1;
+    int status = -1;
     char method[METHOD_NAME_LEN] = {0};
+    char service[SERVICE_NAME_LEN] = {0};
 
     char* msg = (char*)calloc(1,MAX_MSG_LEN);
     if(msg == NULL)
@@ -148,13 +163,13 @@ static void _ebus_msg_func(struct schedule * sch, void *ud)
     {
         if(ctx->fd < 0)
         {
-            if(ebus_connect(ctx,EBUS_UNIX_PATH) < 0)
+            if(_ebus_connect(ctx) < 0)
             {
                 eco_sleep(3);
                 continue;
             }
         }
-        ret = ebus_receive_msg(ctx,method,&msg_type,&session,msg,MAX_MSG_LEN);
+        ret = ebus_receive_msg(ctx->fd,service,method,&msg_type,&session,&status,msg,MAX_MSG_LEN);
         if(ret <= 0)
         {
             fprintf(stderr,"connection is lost \n");
@@ -163,7 +178,9 @@ static void _ebus_msg_func(struct schedule * sch, void *ud)
             continue;
         }
 
-        _ebus_msg_proc(ctx,method,msg_type,session,msg,ret);  //消息处理
+        fprintf(stderr,"msg_type = %d,session = %d,status = %d \n",msg_type,session,status);
+
+        _ebus_msg_proc(ctx,service,method,msg_type,session,status,msg,ret);  //消息处理
 
     }
 
@@ -171,13 +188,17 @@ static void _ebus_msg_func(struct schedule * sch, void *ud)
     msg = NULL;
 }
 
+
+
 //连接
-int ebus_connect(struct ebus_ctx* ctx,const char* path)
+static int _ebus_connect(struct ebus_ctx* ctx)
 {
-    if((ctx == NULL) || (path == NULL))
+    if(ctx == NULL)
     {
         return -1;
     }
+    const char* path = ctx->path;
+
     struct sockaddr_un sun = {.sun_family = AF_UNIX};
     if (strlen(path) >= sizeof(sun.sun_path)) 
     {
@@ -195,11 +216,14 @@ int ebus_connect(struct ebus_ctx* ctx,const char* path)
     int ret = eco_connect(fd,(struct sockaddr*)(&sun),sizeof(sun));
     if(ret < 0)
     {
+        eco_close(fd);
+        ctx->fd = -1;
         return ret;
     }
 
     ctx->fd = fd;
     ctx->session = 0;
+
 
     //shake
     //fd + service  binding
@@ -210,19 +234,54 @@ int ebus_connect(struct ebus_ctx* ctx,const char* path)
         ctx->fd = -1;
     }
 
+    return ret;
+    
+}
+
+static void _ebus_connect_func(struct schedule * sch, void *ud)
+{
+    struct ebus_ctx* ctx = (struct ebus_ctx*)ud;
+
+    int ret = _ebus_connect(ctx);
+    if(ret < 0)
+    {
+        return ;
+    }
+
     //read write coroutine create
     int co = eco_create(eco_get_cur_schedule(),_ebus_msg_func,ctx);
     if(co < 0)
     {
-        eco_close(fd);
+        eco_close(ctx->fd);
         ctx->fd = -1;
-        return -1;
+        return;
     }
     
     eco_resume_later(eco_get_cur_schedule(),co);
+}
 
-    return ret;
+//连接
+int ebus_connect(struct ebus_ctx* ctx,const char* path)
+{
+    if((ctx == NULL) || (path == NULL))
+    {
+        return -1;
+    }
+    snprintf(ctx->path,sizeof(ctx->path),"%s",path);
+    int co = eco_create(eco_get_cur_schedule(),_ebus_connect_func,ctx);
+    if(co < 0)
+    {
+        return -1;
+    }
     
+    eco_resume(eco_get_cur_schedule(),co);
+
+    if(ctx->fd < 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
 //方法调用  -1:失败 0:超时 1:成功
@@ -238,7 +297,7 @@ int ebus_invoke(struct ebus_ctx* ctx,const char* service,const char* method,void
         return -1;
     }
 
-    int ret = ebus_send_msg(ctx,service,method,MSG_TYPE_INVOKE,++ctx->session,req,req_sz);
+    int ret = ebus_send_msg(ctx->fd,service,method,MSG_TYPE_INVOKE,++ctx->session,EBUS_STATUS_OK,req,req_sz);
     if(ret <= 0)
     {
         return -1;
@@ -280,7 +339,7 @@ int ebus_invoke(struct ebus_ctx* ctx,const char* service,const char* method,void
         return ret;
     }
 
-    //成功 node->value: LV:len(int)+msg
+    //成功 node->value: SLV:status(int) + len(int)+msg
     struct rbtree_node* rn = rbtree_find(&ctx->root_session,node.key);
     if(rn == NULL)
     {
@@ -289,8 +348,17 @@ int ebus_invoke(struct ebus_ctx* ctx,const char* service,const char* method,void
         return -1;
     }
 
-    memcpy(resp_sz,rn->value,sizeof(int));
-    memcpy(resp,rn->value+sizeof(int),*resp_sz);
+    int status = -1;
+    memcpy(&status,rn->value,sizeof(int));
+    if(status != EBUS_STATUS_OK)
+    {
+        rbtree_delete(&ctx->root_session,node.key);
+        eco_close(fd[0]);
+        eco_close(fd[1]);
+        return -1;
+    }
+    memcpy(resp_sz,rn->value+sizeof(int),sizeof(int));
+    memcpy(resp,rn->value+sizeof(int)+sizeof(int),*resp_sz);
     
     rbtree_delete(&ctx->root_session,node.key);
     eco_close(fd[0]);
@@ -299,6 +367,13 @@ int ebus_invoke(struct ebus_ctx* ctx,const char* service,const char* method,void
     return 1;
 
     
+}
+
+//响应
+int ebus_response(struct ebus_ctx* ctx,int session,void* req,int req_sz)
+{
+    return ebus_send_msg(ctx->fd,"","",MSG_TYPE_RESP,session,EBUS_STATUS_OK,req,req_sz);
+ 
 }
 
 
