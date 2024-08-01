@@ -29,6 +29,7 @@ int main()
     struct ebus_ctx* ctx = ebus_init("echosrv",mts,sizeof(mts)/sizeof(mts[0]));
     if(ctx == NULL)
     {
+        ebus_exit(ctx);
         return -1;
     }
 
