@@ -10,7 +10,8 @@
 #include "ebus.h"
 #include "ebus_msg.h"
 
-
+#define INVOKE_COUNT_TRIGGER_CHECK  10
+#define INVOKE_SESSION_TIMEOUT  60  
 
 struct ebusd_ctx
 {
@@ -18,6 +19,7 @@ struct ebusd_ctx
     int session; //会话标识
     struct rb_root root_fds; //用于客户端fd与service对应关系
     struct rb_root root_session; //用于客户端fd与session对应关系
+    int invoke_count; //统计rbtree在存储的发起调用次数,用于触发session清理
 };
 
 struct _ebusd_msg_ctx
@@ -48,7 +50,7 @@ static int _ebusd_server_init(const char* path)
 
     snprintf(sun.sun_path,sizeof(sun.sun_path),"%s",path);
 
-    int fd = eco_socket(PF_UNIX,SOCK_STREAM,0);
+    int fd = eco_socket(AF_UNIX,SOCK_STREAM,0);
     if(fd < 0)
     {
         return -1;
@@ -122,6 +124,40 @@ int get_monotonic_time()
     return time.tv_sec;
 }
 
+
+static int _ebusd_session_clean(struct ebusd_ctx* ctx)
+{
+    struct rbtree_node* rbn = NULL; 
+    struct rb_node *rnode;
+    int i = 0;
+    int count = 0;
+    const char* keys[INVOKE_COUNT_TRIGGER_CHECK] = {NULL}; 
+    struct _ebusd_msg_session* ems = NULL;
+    int cur_time  = get_monotonic_time();  
+    rbtree_for_each(ctx->root_session,rnode)
+    {
+        rbn = rb_entry(rnode, struct rbtree_node, node);
+        ems = (struct _ebusd_msg_session*)(rbn->value);
+        if(cur_time - ems->time > INVOKE_SESSION_TIMEOUT)
+        {
+            keys[i++] = rbn->key;
+            if(i > sizeof(keys)/sizeof(keys[0]) - 1)
+            {
+                break;
+            }
+        }
+    }
+    count = i;
+
+    for (i = 0;i < count;i++)
+    {
+        rbtree_delete(&ctx->root_session,keys[i]);
+        ctx->invoke_count--;
+    }
+
+    return 0;
+}
+
 static int _ebusd_msg_proc(struct ebusd_ctx* ctx,int fd,const char* service,const char* method,int msg_type,int session,void* msg,int msg_sz)
 {
     if((ctx == NULL) || (service == NULL) || (method == NULL) || (msg == NULL))
@@ -184,8 +220,7 @@ static int _ebusd_msg_proc(struct ebusd_ctx* ctx,int fd,const char* service,cons
         ems->session = session;
         ems->time = get_monotonic_time(); 
         rbtree_insert(&ctx->root_session,&node);
-
-        //todo:超时未返回,存在资源未清理情况
+        ctx->invoke_count++;
         
     }
     else if(msg_type == MSG_TYPE_RESP)  //调用返回
@@ -202,6 +237,14 @@ static int _ebusd_msg_proc(struct ebusd_ctx* ctx,int fd,const char* service,cons
         struct _ebusd_msg_session* ems = (struct _ebusd_msg_session*)(rbn->value);
         ebus_send_msg(ems->fd,service,method,msg_type,ems->session,EBUS_STATUS_OK,msg,msg_sz);
         rbtree_delete(&ctx->root_session,key);
+        ctx->invoke_count--;
+
+        if(ctx->invoke_count > INVOKE_COUNT_TRIGGER_CHECK)
+        {
+            //清理未返回session
+            _ebusd_session_clean(ctx);
+        }
+
     }
     else  //不支持的消息类型
     {
@@ -257,9 +300,7 @@ static void _ebusd_msg_func(struct schedule * sch, void *ud)
         ret = ebus_receive_msg_ex(fd,service,method,&msg_type,&session,&status,&msg);
         if(ret <= 0)
         {
-            fprintf(stderr,"connection is lost \n");
-            // todo:清理资源 
-            //RBTREE
+            // fprintf(stderr,"connection is lost \n");
             _ebus_del_fds(ctx,fd);
             eco_close(fd);
             break;
@@ -289,11 +330,11 @@ static void _ebusd_accept_func(struct schedule * sch, void *ud)
         cfd = eco_accept(listen_fd, (struct sockaddr *) &cliun, &cliun_len);
         if (cfd < 0) 
         {
-            //errno  EMFILE 未处理,其它情况需要再次accept
+            //errno  todo:EMFILE 未处理,其它情况需要再次accept
             continue;
         }
 
-        fprintf(stderr,"new connection cfd = %d \n",cfd);
+        // fprintf(stderr,"new connection cfd = %d \n",cfd);
 
         struct _ebusd_msg_ctx* mctx = (struct _ebusd_msg_ctx*)calloc(1,sizeof(struct _ebusd_msg_ctx));
         if(mctx == NULL)
