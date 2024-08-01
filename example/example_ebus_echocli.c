@@ -38,6 +38,7 @@ int main()
 
     if(ebus_connect(ctx,EBUS_UNIX_PATH) < 0)
     {
+        ebus_exit(ctx);
         return -1;
     }
 
