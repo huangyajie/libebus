@@ -10,7 +10,7 @@
 #include "ebus.h"
 #include "ebus_msg.h"
 
-#define INVOKE_COUNT_TRIGGER_CHECK  10
+#define INVOKE_COUNT_TRIGGER_CHECK  1000
 #define INVOKE_SESSION_TIMEOUT  60  
 
 struct ebusd_ctx
