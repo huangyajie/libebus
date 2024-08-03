@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -20,6 +21,7 @@ struct ebusd_ctx
     struct rb_root root_fds; //用于客户端fd与service对应关系
     struct rb_root root_session; //用于客户端fd与session对应关系
     int invoke_count; //统计rbtree在存储的发起调用次数,用于触发session清理
+    int idle_fd; //EMFILE
 };
 
 struct _ebusd_msg_ctx
@@ -89,10 +91,10 @@ struct ebusd_ctx* ebusd_init(const char* path)
     {
         return NULL;
     }
+    ctx->idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
     rbtree_init(ctx->root_fds);
     rbtree_init(ctx->root_session);
-
 
     return ctx;
 }
@@ -106,7 +108,9 @@ int ebusd_exit(struct ebusd_ctx* ctx)
     }
 
     eco_close(ctx->fd);
+    close(ctx->idle_fd);
     ctx->fd = -1;
+    ctx->idle_fd = -1;
     rbtree_exit(&ctx->root_fds);
     rbtree_exit(&ctx->root_session);
     free(ctx);
@@ -330,7 +334,13 @@ static void _ebusd_accept_func(struct schedule * sch, void *ud)
         cfd = eco_accept(listen_fd, (struct sockaddr *) &cliun, &cliun_len);
         if (cfd < 0) 
         {
-            //errno  todo:EMFILE 未处理,其它情况需要再次accept
+            if(errno == EMFILE)
+            {
+                close(ctx->idle_fd);
+                ctx->idle_fd = eco_accept(listen_fd, (struct sockaddr *) &cliun, &cliun_len);
+                eco_close(ctx->idle_fd);
+                ctx->idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            }
             continue;
         }
 
